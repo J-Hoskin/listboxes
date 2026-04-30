@@ -1,0 +1,102 @@
+<!--
+    Example view wiring two OrderedAnimatedListBoxes side by side.
+
+    Transfer is triggered by the → / ← button in each item template, which binds
+    to TransferCommand on its parent listbox via $parent[]. The listbox carries the
+    correct command for its direction so the template doesn't need to know which side
+    it's on.
+
+    Duration properties: AnimationDuration is the global fallback. Override any phase
+    individually with EntryDuration / ExitDuration / ReorderDuration.
+-->
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:YourApp.Controls"
+             xmlns:vm="clr-namespace:YourApp.Examples"
+             x:Class="YourApp.Examples.TwoListView"
+             x:DataType="vm:TwoListParentViewModel">
+
+    <StackPanel Orientation="Horizontal" Spacing="20">
+
+        <!-- LEFT LIST -->
+        <StackPanel Spacing="8">
+            <controls:OrderedAnimatedListBox x:Name="LeftList"
+                FullItems="{Binding LeftItemsBindable}"
+                Coordinator="{Binding}"
+                TransferCommand="{Binding TransferLeftToRightCommand}"
+                EntryDirection="Right"
+                ExitDirection="Right"
+                AnimationDuration="0:0:0.2"
+                PageSize="4"
+                CurrentPage="{Binding LeftPage, Mode=TwoWay}"
+                Width="240"
+                ClipToBounds="True">
+                <controls:OrderedAnimatedListBox.ItemTemplate>
+                    <DataTemplate x:DataType="vm:LeftItemVm">
+                        <Border Padding="12,8" Margin="0,2" Background="#222" CornerRadius="4">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <TextBlock Grid.Column="0" Text="{Binding Name}" Foreground="White"
+                                           VerticalAlignment="Center"/>
+                                <Button Grid.Column="1" Content="→"
+                                        Command="{Binding $parent[controls:OrderedAnimatedListBox].TransferCommand}"
+                                        CommandParameter="{Binding}" />
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </controls:OrderedAnimatedListBox.ItemTemplate>
+            </controls:OrderedAnimatedListBox>
+
+            <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                <Button Content="◀" Command="{Binding #LeftList.PreviousPageCommand}" />
+                <TextBlock VerticalAlignment="Center">
+                    <Run Text="Page "/>
+                    <Run Text="{Binding #LeftList.CurrentPage}"/>
+                    <Run Text=" / "/>
+                    <Run Text="{Binding #LeftList.PageCount}"/>
+                </TextBlock>
+                <Button Content="▶" Command="{Binding #LeftList.NextPageCommand}" />
+            </StackPanel>
+        </StackPanel>
+
+        <!-- RIGHT LIST -->
+        <StackPanel Spacing="8">
+            <controls:OrderedAnimatedListBox x:Name="RightList"
+                FullItems="{Binding RightItemsBindable}"
+                Coordinator="{Binding}"
+                TransferCommand="{Binding TransferRightToLeftCommand}"
+                EntryDirection="Left"
+                ExitDirection="Left"
+                AnimationDuration="0:0:0.2"
+                PageSize="4"
+                CurrentPage="{Binding RightPage, Mode=TwoWay}"
+                Width="240"
+                ClipToBounds="True">
+                <controls:OrderedAnimatedListBox.ItemTemplate>
+                    <DataTemplate x:DataType="vm:RightItemVm">
+                        <Border Padding="12,8" Margin="0,2" Background="#224" CornerRadius="4">
+                            <Grid ColumnDefinitions="Auto,*">
+                                <Button Grid.Column="0" Content="←"
+                                        Command="{Binding $parent[controls:OrderedAnimatedListBox].TransferCommand}"
+                                        CommandParameter="{Binding}" />
+                                <TextBlock Grid.Column="1" Text="{Binding Name}" Foreground="White"
+                                           VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </controls:OrderedAnimatedListBox.ItemTemplate>
+            </controls:OrderedAnimatedListBox>
+
+            <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                <Button Content="◀" Command="{Binding #RightList.PreviousPageCommand}" />
+                <TextBlock VerticalAlignment="Center">
+                    <Run Text="Page "/>
+                    <Run Text="{Binding #RightList.CurrentPage}"/>
+                    <Run Text=" / "/>
+                    <Run Text="{Binding #RightList.PageCount}"/>
+                </TextBlock>
+                <Button Content="▶" Command="{Binding #RightList.NextPageCommand}" />
+            </StackPanel>
+        </StackPanel>
+
+    </StackPanel>
+</UserControl>
