@@ -13,27 +13,31 @@ using YourApp.ViewModels;
 namespace YourApp.Controls;
 
 /// <summary>
-/// AnimatedListBox variant that orders its items by IOrderedAnimatedItem.Order and animates
+/// AnimatedListBox variant that orders items by IOrderedAnimatedItem.Order and animates
 /// reorder operations using FLIP (First, Last, Invert, Play).
 ///
-/// Reorder cases handled:
-///   1. Old + new positions both on the current page  → FLIP between slots (ResolvedReorderDuration)
-///   2. Item leaves current page due to order change   → slide out bottom  (ResolvedExitDuration)
-///   3. Item arrives on current page from elsewhere    → slide in from bottom (ResolvedEntryDuration)
+/// Reorder cases:
+///   1. Old and new positions both on current page  → FLIP between slots (ResolvedReorderDuration)
+///   2. Item leaves current page due to order change → slide out bottom  (ResolvedExitDuration)
+///   3. Item arrives on current page from elsewhere  → slide in from bottom (ResolvedEntryDuration)
+///
+/// FLIP animations run through the base class RunAnimation method so they are correctly
+/// counted by _inflightCount and the pipeline gate releases at the right time.
 /// </summary>
 public class OrderedAnimatedListBox : AnimatedListBox
 {
-    /// <summary>
-    /// Snapshot of each visible container's bounds, captured before layout runs.
-    /// Used to compute the FLIP delta once layout has settled into the new order.
-    /// </summary>
     private readonly Dictionary<Guid, Rect> _preLayoutBounds = new();
 
-    private bool _flipPending;
+    /// <summary>
+    /// Incremented on every OnBeforeAnimatedDiff and every SnapAllAnimations.
+    /// The ApplyFlip closure captures the generation at capture time and skips execution
+    /// if the generation has changed — discarding stale FLIP data from collapsed updates.
+    /// </summary>
+    private int _flipGeneration;
 
-    // --------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Ordering
-    // --------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     protected override List<object> MaterializeFullItems()
     {
@@ -45,25 +49,21 @@ public class OrderedAnimatedListBox : AnimatedListBox
             .ToList();
     }
 
-    // --------------------------------------------------------------------
-    // FLIP hook — capture bounds before pagination refreshes layout, apply after
-    // --------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // FLIP hook — capture bounds before layout changes, animate after
+    // -------------------------------------------------------------------------
 
-    protected override void RefreshPagination(bool animate)
+    protected override void OnBeforeAnimatedDiff()
     {
-        if (animate)
-        {
-            CapturePreLayoutBounds();
-            _flipPending = true;
-        }
+        CapturePreLayoutBounds();
+        var capturedGeneration = ++_flipGeneration;
 
-        base.RefreshPagination(animate);
-
-        if (_flipPending)
+        // Post at Render priority so layout has settled before we read new positions.
+        Dispatcher.UIThread.Post(() =>
         {
-            // Post at Render priority so layout has settled before we read new positions.
-            Dispatcher.UIThread.Post(ApplyFlip, DispatcherPriority.Render);
-        }
+            if (capturedGeneration == _flipGeneration)
+                ApplyFlip();
+        }, DispatcherPriority.Render);
     }
 
     private void CapturePreLayoutBounds()
@@ -83,7 +83,6 @@ public class OrderedAnimatedListBox : AnimatedListBox
 
     private void ApplyFlip()
     {
-        _flipPending = false;
         if (_preLayoutBounds.Count == 0) return;
 
         foreach (var item in VisibleItems)
@@ -109,7 +108,7 @@ public class OrderedAnimatedListBox : AnimatedListBox
             {
                 Duration = ResolvedReorderDuration,
                 Easing = new CubicEaseOut(),
-                FillMode = FillMode.Forward,
+                FillMode = FillMode.None,
                 Children =
                 {
                     new KeyFrame
@@ -133,27 +132,41 @@ public class OrderedAnimatedListBox : AnimatedListBox
                 }
             };
 
+            // Route through base RunAnimation so _inflightCount is tracked correctly.
+            // This ensures the pipeline gate doesn't release until FLIP animations finish.
             var capturedContainer = container;
-            _ = animation.RunAsync(container.Translate).ContinueWith(_ =>
-            {
-                Dispatcher.UIThread.Post(() =>
+            RunAnimationForFlip(
+                container,
+                animation,
+                onComplete: () =>
+                {
+                    capturedContainer.Translate.X = 0;
+                    capturedContainer.Translate.Y = 0;
+                },
+                onCancelled: () =>
                 {
                     capturedContainer.Translate.X = 0;
                     capturedContainer.Translate.Y = 0;
                 });
-            });
         }
 
         _preLayoutBounds.Clear();
     }
 
-    // --------------------------------------------------------------------
-    // Direction overrides for order-driven page transitions
-    //
-    // Items arriving from / leaving to another page slide in/out from the bottom edge.
-    // This conveys the idea that the item moved past the visible page boundary.
-    // Same-page reorders are handled by FLIP above and don't go through these methods.
-    // --------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Snap override — invalidate pending FLIP data
+    // -------------------------------------------------------------------------
+
+    protected override void OnSnapAllAnimations()
+    {
+        // Bump generation so any pending ApplyFlip post is discarded.
+        _flipGeneration++;
+        _preLayoutBounds.Clear();
+    }
+
+    // -------------------------------------------------------------------------
+    // Page-edge entry/exit directions
+    // -------------------------------------------------------------------------
 
     protected override AnimationDirection? ResolveEntryDirection(EntryReason reason)
     {
@@ -170,4 +183,5 @@ public class OrderedAnimatedListBox : AnimatedListBox
 
         return base.ResolveExitDirection(reason);
     }
+
 }

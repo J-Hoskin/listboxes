@@ -4,14 +4,14 @@ using System.Collections.Concurrent;
 namespace YourApp.Controls;
 
 /// <summary>
-/// Default coordinator. Your parent view-model can either derive from this or implement
-/// ITransferCoordinator directly.
+/// Default coordinator implementation. Derive your parent view-model from this class,
+/// or implement ITransferCoordinator + IPeekableCoordinator directly.
 ///
-/// Usage: before mutating the cache to move an item between filtered lists, call
-/// StampTransfer(itemId, ExitReason.ToSibling, EntryReason.FromSibling). The animations on
-/// both controls will resolve their reasons when the change propagates.
+/// Usage: call StampTransfer(id, exit, entry) immediately before mutating the cache.
+/// DynamicData propagates the change synchronously on the UI thread, so both controls
+/// will see the stamped reasons when their CollectionChanged handlers fire.
 /// </summary>
-public class TransferCoordinator : ITransferCoordinator
+public class TransferCoordinator : ITransferCoordinator, IPeekableCoordinator
 {
     private readonly ConcurrentDictionary<Guid, EntryReason> _entries = new();
     private readonly ConcurrentDictionary<Guid, ExitReason> _exits = new();
@@ -20,6 +20,9 @@ public class TransferCoordinator : ITransferCoordinator
 
     public void StampExit(Guid itemId, ExitReason reason) => _exits[itemId] = reason;
 
+    /// <summary>
+    /// Stamp both sides of a transfer in one call. Must be called before cache.Edit.
+    /// </summary>
     public void StampTransfer(Guid itemId, ExitReason exit, EntryReason entry)
     {
         _exits[itemId] = exit;
@@ -31,4 +34,10 @@ public class TransferCoordinator : ITransferCoordinator
 
     public ExitReason ConsumeExitReason(Guid itemId)
         => _exits.TryRemove(itemId, out var r) ? r : ExitReason.Default;
+
+    /// <summary>
+    /// Returns true if any pending reason exists for any item.
+    /// Does not consume anything. Used by AnimatedListBox.ClassifyChange.
+    /// </summary>
+    public bool HasAnyPendingReason() => !_entries.IsEmpty || !_exits.IsEmpty;
 }
