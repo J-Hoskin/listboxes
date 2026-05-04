@@ -1,0 +1,49 @@
+---
+title: Scenario 11 — Multiple Rapid Transfers (Queue Ordering)
+---
+sequenceDiagram
+    actor User
+    participant ParentVM as ParentViewModel
+    participant Cache as SourceCache
+    participant LeftBox as Left AnimatedListBox
+    participant RightBox as Right AnimatedListBox
+    participant Pipeline as Pipeline
+
+    Note over LeftBox,RightBox: User clicks two items in rapid succession
+
+    User->>ParentVM: Click Item A →
+    ParentVM->>ParentVM: StampTransfer(A.id, ToSibling, FromSibling)
+    ParentVM->>Cache: cache.Edit(A.IsOnRight = true)
+    Cache-->>LeftBox: CollectionChanged (Remove A)
+    Cache-->>RightBox: CollectionChanged (Add A)
+
+    LeftBox->>Pipeline: Transfer A\njumps queue (idle)\n_pipelineBusy = true
+    RightBox->>Pipeline: Transfer A\njumps queue (idle)\n_pipelineBusy = true
+
+    Note over LeftBox,RightBox: A's slide animations start\n_inflightCount = 1 on each
+
+    User->>ParentVM: Click Item B → (50ms later, during A's animation)
+    ParentVM->>ParentVM: StampTransfer(B.id, ToSibling, FromSibling)
+    ParentVM->>Cache: cache.Edit(B.IsOnRight = true)
+    Cache-->>LeftBox: CollectionChanged (Remove B)
+    Cache-->>RightBox: CollectionChanged (Add B)
+
+    LeftBox->>LeftBox: ClassifyChange → Transfer\n_pipelineBusy = true → jump queue
+    Note over LeftBox: SnapAllAnimations()\nA's animation snapped to final position\n_inflightCount = 0
+
+    LeftBox->>Pipeline: _pipeline.Clear()\n_pipelineBusy = false
+    LeftBox->>Pipeline: Enqueue Transfer B
+    Pipeline->>Pipeline: TryProcessNext immediately\n_pipelineBusy = true
+
+    RightBox->>RightBox: Same sequence for right side
+
+    Note over LeftBox,RightBox: B's slide animations start\nA is already at rest (snapped)\nB animates cleanly
+
+    Note over LeftBox,RightBox: B's animations complete\n_inflightCount = 0
+
+    LeftBox->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false
+    RightBox->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false
+
+    Pipeline->>Pipeline: Queue empty — done
+
+    Note over LeftBox,RightBox: Trade-off: A's animation was cut short\nbut B animates fully.\nTransfers always take priority.\nThis is the intended behaviour —\nthe most recent user action\nalways animates completely.

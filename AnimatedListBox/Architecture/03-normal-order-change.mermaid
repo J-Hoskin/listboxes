@@ -1,0 +1,53 @@
+---
+title: Scenario 2 — Normal Order Change / FLIP (Happy Path)
+---
+sequenceDiagram
+    participant Service as Backend Service
+    participant Cache as SourceCache
+    participant Sub as Throttled Subscription\n(150ms)
+    participant Box as OrderedAnimatedListBox
+    participant Pipeline as Pipeline
+    participant FLIP as FLIP Engine
+
+    Service->>Cache: Update item.Order
+
+    Note over Sub: Throttle window starts\nMore order changes may arrive\nand be collapsed here
+
+    Sub-->>Box: CollectionChanged (Move) after 150ms
+
+    Box->>Box: ClassifyChange\nHasAnyPendingReason() = false\ne.Action = Move\n→ ChangeType.OrderChange
+
+    alt Queue is empty and pipeline idle
+        Box->>Pipeline: Enqueue OrderChange snapshot
+        Pipeline->>Pipeline: TryProcessNext\n_pipelineBusy = true
+    else Previous OrderChange already queued
+        Box->>Pipeline: Replace last OrderChange\n(collapse to latest state)
+        Note over Pipeline: Only final order state matters\nIntermediate states discarded
+    end
+
+    Pipeline->>Box: ProcessSnapshot(OrderChange)
+    Box->>FLIP: OnBeforeAnimatedDiff()\nCapturePreLayoutBounds()
+    Note over FLIP: Snapshot: {A→(0,0), B→(0,40), C→(0,80), D→(0,120)}
+    Note over FLIP: capturedGeneration = ++_flipGeneration
+
+    Box->>Box: DiffVisible(newOrder)\nVisibleItems.Move(2→0)\nObservableCollection raises Move event\nListBox re-layouts
+
+    Note over Box: Layout now reflects new order\nContainers at new physical positions
+
+    FLIP->>FLIP: Post ApplyFlip at DispatcherPriority.Render
+
+    Note over FLIP: Render pass completes\nApplyFlip fires
+
+    FLIP->>FLIP: Check capturedGeneration == _flipGeneration\n(no newer refresh arrived — proceed)
+
+    loop For each item that moved
+        FLIP->>FLIP: Read new position from layout
+        Note over FLIP: B is now at (0,0) but was at (0,40)\ndx=0, dy=40
+        FLIP->>FLIP: container.Translate.Y = +40  [snap to old pos]
+        FLIP->>FLIP: RunAnimation: Translate.Y 40 → 0
+        Note over FLIP: Item appears to animate\nfrom its old position to its new one
+    end
+
+    FLIP->>FLIP: _inflightCount reaches 0
+    Box->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false
+    Pipeline->>Pipeline: TryProcessNext (queue empty — done)

@@ -1,0 +1,52 @@
+---
+title: Scenario 5 — Order Change Arrives While Transfer Animating
+---
+sequenceDiagram
+    actor User
+    participant Service as Backend Service
+    participant ParentVM as ParentViewModel
+    participant Cache as SourceCache
+    participant Box as AnimatedListBox
+    participant Pipeline as Pipeline
+    participant Anim as Transfer Animation
+
+    User->>ParentVM: Click transfer button
+    ParentVM->>ParentVM: StampTransfer(id, ToSibling, FromSibling)
+    ParentVM->>Cache: cache.Edit(IsOnRight = true)
+    Cache-->>Box: CollectionChanged → Transfer
+    Box->>Pipeline: Transfer jumps queue\n_pipelineBusy = true
+    Pipeline->>Anim: RunSlide out + RunSlide in\n_inflightCount = 2
+
+    Note over Anim: ~60ms into 200ms transfer animation
+
+    Service->>Cache: Order change on another item
+    Note over Service: Throttle window starts
+
+    Note over Service: More order changes may arrive\nand collapse here during the 150ms window
+
+    Cache-->>Box: CollectionChanged (Move) after 150ms
+
+    Box->>Box: ClassifyChange\nHasAnyPendingReason() = false\n→ ChangeType.OrderChange
+
+    Box->>Box: _pipelineBusy = true\ncannot process now
+
+    Box->>Pipeline: Check queue for existing OrderChange\nNone found — enqueue new one
+
+    Note over Pipeline: Queue: [OrderChange]
+    Note over Pipeline: Pipeline is busy (transfer animating)\nOrder change waits
+
+    Note over Anim: Transfer animation completes (200ms)\n_inflightCount = 0
+
+    Box->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false
+    Pipeline->>Pipeline: TryProcessNext\nDequeue OrderChange\n_pipelineBusy = true
+
+    Pipeline->>Box: ProcessSnapshot(OrderChange)
+    Box->>Box: OnBeforeAnimatedDiff\nCapturePreLayoutBounds\n(correctly reflects post-transfer state)
+    Box->>Box: DiffVisible(reordered items)
+    Box->>Box: FLIP animations play
+
+    Box->>Box: FLIP complete\n_inflightCount = 0
+    Box->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false
+    Pipeline->>Pipeline: Queue empty — done
+
+    Note over Box: Result: Transfer played fully,\nthen order change played.\nNo visual glitches.

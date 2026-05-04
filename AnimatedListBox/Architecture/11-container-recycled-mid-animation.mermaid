@@ -1,0 +1,40 @@
+---
+title: Scenario 10 — Container Recycled Mid-Animation
+---
+sequenceDiagram
+    participant Box as AnimatedListBox
+    participant Pool as Container Pool
+    participant C as Container C
+    participant ItemA as Item A (old)
+    participant ItemB as Item B (new)
+    participant ActiveEntries as _activeEntries
+
+    Note over C: Container C is displaying Item A\nEntry slide-in animation running\n_activeEntries[C] = cts1\n_inflightCount = 1
+
+    Note over C: ~60ms into animation
+
+    Box->>Box: DiffVisible\nItem A removed from desired\nItem B needs to be shown
+
+    Note over Box: Avalonia recycles Container C for Item B
+
+    Box->>C: ClearContainerForItemOverride(C)
+    C->>ActiveEntries: _activeEntries.TryGetValue(C) = cts1\ncts1.Cancel()\n_activeEntries.Remove(C)
+    C->>C: ResetVisuals()\nTranslate = (0,0), Opacity = 1
+
+    Box->>C: PrepareContainerForItemOverride(C, ItemB)
+    C->>ActiveEntries: _activeEntries.TryGetValue(C)\n= null (was just removed — clean)
+    C->>C: ResetVisuals() again (belt+suspenders)
+    C->>Box: ConsumeEntryReason(ItemB.id)
+    C->>C: StartEntryAnimation(ItemB)\ncts2 created\n_activeEntries[C] = cts2\n_inflightCount++ (for new animation)
+
+    Note over C: Item B's animation starts\nfrom clean neutral state
+
+    Note over C: Meanwhile, Item A's cancelled animation\ncontinuation fires on the dispatcher...
+
+    C-->>ActiveEntries: ContinueWith fires\nDispatcher.UIThread.Post runs\n_activeEntries.TryGetValue(C) = cts2\ncts2 != cts1\n→ DO NOT remove cts2 (compare-before-remove guard)
+
+    C-->>C: cts1.IsCancellationRequested = true\n→ onCancelled?.Invoke()\n→ container.ResetVisuals()
+
+    Note over C: ResetVisuals called again but\nItem B's animation immediately\nre-asserts its transform values\nNo visible glitch
+
+    Note over Box: _inflightCount for cts1 decremented via cancellation path\n_inflightCount for cts2 tracks Item B's animation independently

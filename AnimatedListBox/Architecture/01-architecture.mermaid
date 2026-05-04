@@ -1,0 +1,67 @@
+---
+title: AnimatedListBox — Architecture Overview
+---
+graph TB
+    subgraph ParentVM["Parent ViewModel (derives TransferCoordinator)"]
+        SC[("SourceCache\n&lt;ItemModel, Guid&gt;")]
+        TC[TransferCoordinator\nstamps entry/exit reasons\nbefore cache mutation]
+        CMD_L[TransferLeftToRightCommand]
+        CMD_R[TransferRightToLeftCommand]
+    end
+
+    subgraph Coordination["Coordination Layer"]
+        ITC[ITransferCoordinator\nConsumeEntryReason\nConsumeExitReason]
+        IPC[IPeekableCoordinator\nHasAnyPendingReason]
+    end
+
+    subgraph LeftSide["Left Side"]
+        LVM[LeftListViewModel\nReadOnlyObservableCollection]
+        subgraph LBox["OrderedAnimatedListBox (Left)"]
+            LP[Pipeline\nQueue + Gate]
+            LD[DiffVisible]
+            LA[Animation Engine\nRunSlide / RunFade / FLIP]
+            LV[VisibleItems\nObservableCollection]
+            LC[AnimatedItemContainers\nx0..4]
+        end
+    end
+
+    subgraph RightSide["Right Side"]
+        RVM[RightListViewModel\nReadOnlyObservableCollection]
+        subgraph RBox["OrderedAnimatedListBox (Right)"]
+            RP[Pipeline\nQueue + Gate]
+            RD[DiffVisible]
+            RA[Animation Engine\nRunSlide / RunFade / FLIP]
+            RV[VisibleItems\nObservableCollection]
+            RC[AnimatedItemContainers\nx0..4]
+        end
+    end
+
+    SC -->|"Connect().Filter(!IsOnRight)\n.Throttle(150ms)"| LVM
+    SC -->|"Connect().Filter(IsOnRight)\n.Throttle(150ms)"| RVM
+
+    LVM -->|FullItems binding| LP
+    RVM -->|FullItems binding| RP
+
+    TC -->|implements| ITC
+    TC -->|implements| IPC
+
+    ITC -->|Coordinator property| LBox
+    ITC -->|Coordinator property| RBox
+    IPC -->|ClassifyChange peek| LBox
+    IPC -->|ClassifyChange peek| RBox
+
+    CMD_L -->|TransferCommand property| LBox
+    CMD_R -->|TransferCommand property| RBox
+
+    LP --> LD --> LA --> LV --> LC
+    RP --> RD --> RA --> RV --> RC
+
+    CMD_L -->|"StampTransfer(id)\nthen cache.Edit"| TC
+    CMD_R -->|"StampTransfer(id)\nthen cache.Edit"| TC
+
+    style ParentVM fill:#1a2a3a,stroke:#4a9eff,color:#fff
+    style Coordination fill:#1a3a2a,stroke:#4aff9e,color:#fff
+    style LeftSide fill:#2a1a3a,stroke:#9e4aff,color:#fff
+    style RightSide fill:#3a2a1a,stroke:#ff9e4a,color:#fff
+    style LBox fill:#1a1a2a,stroke:#9e4aff,color:#fff
+    style RBox fill:#1a1a2a,stroke:#ff9e4a,color:#fff

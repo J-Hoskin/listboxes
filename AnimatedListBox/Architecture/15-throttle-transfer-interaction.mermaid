@@ -1,0 +1,43 @@
+---
+title: Scenario 14 — Throttle and Transfer Interaction
+---
+sequenceDiagram
+    participant Service as Backend Service
+    participant User as User
+    participant ParentVM as ParentViewModel
+    participant Cache as SourceCache
+    participant Sub as Throttled Subscription\n(150ms)
+    participant Box as AnimatedListBox
+
+    Note over Service: Service fires rapid order changes
+
+    Service->>Cache: Order changes (t=0ms)
+    Note over Sub: Throttle window open
+
+    Service->>Cache: Order changes (t=30ms)
+    Service->>Cache: Order changes (t=60ms)
+
+    Note over Sub: Throttle window still open
+
+    User->>ParentVM: Click transfer (t=80ms)
+    ParentVM->>ParentVM: StampTransfer(id, ...) — stamps coordinator
+    ParentVM->>Cache: cache.Edit(IsOnRight = true)
+
+    Note over Sub: cache.Edit fires CollectionChanged directly\nThis is NOT throttled\n(transfer comes from the cache.Edit subscription path, not the throttled bind)
+
+    Cache-->>Box: CollectionChanged (Remove) — immediate
+
+    Box->>Box: ClassifyChange\nHasAnyPendingReason() = true → Transfer
+    Box->>Box: Jump queue, process transfer
+
+    Note over Sub: Throttle window expires (t=150ms)\nEmits the collapsed order change snapshot
+
+    Sub-->>Box: CollectionChanged (Move) — throttled order changes
+
+    Box->>Box: ClassifyChange\nHasAnyPendingReason() = false\n(stamp was consumed by transfer)\n→ OrderChange
+
+    Note over Box: This order change is now correctly classified\nand queued behind the transfer
+
+    Note over Box: KEY QUESTION: Can a throttled order change\narrive BEFORE the transfer?\n\nOnly if the throttle window closes (150ms)\nbefore the user clicks. In that case:\n1. Order change emits and processes first\n2. User clicks\n3. Transfer processes second\n\nThis is correct — the order change\nwas genuinely earlier.
+
+    Note over Box: The dangerous case is if a stamp exists\nwhen an unrelated order change arrives\nthrough the throttle. This is fixed by\nHasAnyPendingReason() checking BOTH\nentries and exits — a stamp only exists\nbetween StampTransfer() and\nConsumeXxxReason(), which is a very\nshort window on the same dispatcher tick.

@@ -1,0 +1,62 @@
+---
+title: Scenario 7 — Item Re-Enters While Mid-Exit (Re-Entry Race Guard)
+---
+sequenceDiagram
+    participant Service as Backend Service
+    participant Cache as SourceCache
+    participant Box as AnimatedListBox
+    participant Pipeline as Pipeline
+    participant ExitAnim as Exit Animation (ghost)
+    participant Containers as Container Pool
+
+    Note over Box: Item A is visible at index 1
+
+    Service->>Cache: Remove item A
+    Cache-->>Box: CollectionChanged (Remove)
+    Box->>Pipeline: Enqueue AddRemove
+    Pipeline->>Box: ProcessSnapshot
+    Box->>Box: DiffVisible → BeginExit(A)
+    Note over ExitAnim: _activeExits[A.id] = handle\nA stays in VisibleItems as ghost\nRunFade(1→0) starts\n_inflightCount = 1
+
+    Note over ExitAnim: ~80ms into 200ms fade
+
+    Service->>Cache: AddOrUpdate item A (re-added)
+    Cache-->>Box: CollectionChanged (Add) after 150ms throttle
+
+    Box->>Box: ClassifyChange → AddRemove
+    Box->>Pipeline: Enqueue AddRemove
+
+    Note over Pipeline: Pipeline is busy (exit animating)\nEnqueue and wait
+
+    ExitAnim->>ExitAnim: Animation completes\n_inflightCount--
+
+    Box->>Box: onComplete callback fires\nCheck: _activeExits.ContainsKey(A.id)?
+    Note over Box: YES — still registered\n_activeExits.Remove(A.id)\nVisibleItems.RemoveAt(IndexOfById(A.id))\nA fully gone from VisibleItems
+
+    Box->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false
+    Pipeline->>Pipeline: TryProcessNext\nDequeue AddRemove (re-add A)
+
+    Pipeline->>Box: ProcessSnapshot
+    Box->>Box: DiffVisible\nA not in VisibleItems → insert
+    Box->>Containers: PrepareContainerForItemOverride
+
+    Note over Containers: No active exit for A\n(it was cleaned up above)\nResetVisuals() — clean state
+    Containers->>Containers: ConsumeEntryReason(A.id)\n→ Default (no stamp)\nRunFade(0→1)
+
+    Note over Box: A fades back in cleanly
+
+    Note over Box: --- DANGEROUS VARIANT ---
+    Note over Box: What if re-add arrives BEFORE exit completes?
+
+    Note over ExitAnim: Exit still running at t=80ms
+
+    Pipeline->>Pipeline: _pipelineBusy = true (exit running)\nAddRemove waits in queue
+
+    ExitAnim->>ExitAnim: Exit completes at t=200ms
+    Box->>Box: onComplete: _activeExits.ContainsKey(A.id) = true\nRemove ghost → clean
+    Box->>Pipeline: Gate releases
+
+    Pipeline->>Box: Process re-add → PrepareContainer
+    Containers->>Containers: _activeExits.TryGetValue(A.id) = false\n(already cleaned)\nSafe to animate entry
+
+    Note over Box: No race — exit always completes\nbefore re-add processes\nbecause pipeline is gated

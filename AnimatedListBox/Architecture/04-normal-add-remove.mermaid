@@ -1,0 +1,59 @@
+---
+title: Scenario 3 — Normal Add / Remove (Happy Path)
+---
+sequenceDiagram
+    participant Service as Backend Service
+    participant Cache as SourceCache
+    participant Sub as Throttled Subscription
+    participant Box as AnimatedListBox
+    participant Pipeline as Pipeline
+    participant Containers as Container Pool
+
+    Service->>Cache: AddOrUpdate(newItem)
+    Sub-->>Box: CollectionChanged (Add) after 150ms
+
+    Box->>Box: ClassifyChange\nHasAnyPendingReason() = false\ne.Action = Add\n→ ChangeType.AddRemove
+
+    Box->>Pipeline: Enqueue AddRemove snapshot
+    Note over Pipeline: AddRemove is never collapsed\nEach one is preserved
+
+    Pipeline->>Pipeline: TryProcessNext\n_pipelineBusy = true
+    Pipeline->>Box: ProcessSnapshot(AddRemove)
+    Box->>Box: OnBeforeAnimatedDiff() — no-op in base class
+
+    Box->>Box: DiffVisible(desired)\nNewItem not in VisibleItems\nVisibleItems.Insert(idx, newItem)
+
+    Box->>Containers: PrepareContainerForItemOverride
+    Containers->>Containers: Cancel prior animation (none)\nResetVisuals() — snap to neutral
+    Containers->>Box: ConsumeEntryReason(id)
+    Note over Containers: No stamp → EntryReason.Default
+    Containers->>Containers: RunFade(0 → 1, EntryDuration)\nOpacity animates in
+
+    Containers->>Containers: _inflightCount++
+
+    Note over Containers: 200ms fade plays
+
+    Containers->>Containers: Animation complete\nOpacity snapped to 1\n_inflightCount--
+
+    Box->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false
+
+    Note over Box: --- REMOVE SCENARIO ---
+
+    Service->>Cache: Remove(existingItem)
+    Sub-->>Box: CollectionChanged (Remove) after 150ms
+
+    Box->>Pipeline: Enqueue AddRemove snapshot
+    Pipeline->>Box: ProcessSnapshot
+    Box->>Box: DiffVisible\nItem in VisibleItems, not in desired\nnot in _activeExits\nBeginExit(item)
+
+    Box->>Box: ConsumeExitReason(id)
+    Note over Box: No stamp → ExitReason.Default
+    Box->>Box: RunFade(1 → 0, ExitDuration)\nItem stays in VisibleItems as ghost
+
+    Box->>Box: _inflightCount++
+
+    Note over Box: 200ms fade plays\nItem visible but fading
+
+    Box->>Box: Animation complete\n_activeExits.ContainsKey(id) = true\n_activeExits.Remove(id)\nVisibleItems.RemoveAt(IndexOfById(id))\n_inflightCount--
+
+    Box->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false

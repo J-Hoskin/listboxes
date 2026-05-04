@@ -1,0 +1,52 @@
+---
+title: Scenario 1 — Normal Transfer (Happy Path)
+---
+sequenceDiagram
+    actor User
+    participant Button as Transfer Button
+    participant ParentVM as ParentViewModel
+    participant Coord as TransferCoordinator
+    participant Cache as SourceCache
+    participant LeftBox as Left AnimatedListBox
+    participant RightBox as Right AnimatedListBox
+
+    User->>Button: Click →
+
+    Note over ParentVM: StampTransfer BEFORE cache.Edit
+    Button->>ParentVM: TransferLeftToRightCommand.Execute(itemVm)
+    ParentVM->>Coord: StampTransfer(id, ToSibling, FromSibling)
+    Note over Coord: _exits[id] = ToSibling\n_entries[id] = FromSibling
+
+    ParentVM->>Cache: cache.Edit(IsOnRight = true)
+
+    par DynamicData propagates synchronously
+        Cache-->>LeftBox: CollectionChanged (Remove)
+        Cache-->>RightBox: CollectionChanged (Add)
+    end
+
+    Note over LeftBox: ClassifyChange\nHasAnyPendingReason() = true\n→ ChangeType.Transfer
+    Note over RightBox: ClassifyChange\nHasAnyPendingReason() = true\n→ ChangeType.Transfer
+
+    LeftBox->>LeftBox: Transfer jumps queue\n_pipelineBusy = false\nno snap needed (idle)
+    RightBox->>RightBox: Transfer jumps queue\n_pipelineBusy = false\nno snap needed (idle)
+
+    par Both process on same dispatcher tick
+        LeftBox->>LeftBox: DiffVisible → BeginExit(item)
+        LeftBox->>Coord: ConsumeExitReason(id) → ToSibling
+        LeftBox->>LeftBox: RunSlide(container, Right, out)\nTranslate: 0 → +width
+
+        RightBox->>RightBox: DiffVisible → insert item
+        RightBox->>RightBox: PrepareContainerForItemOverride
+        RightBox->>Coord: ConsumeEntryReason(id) → FromSibling
+        RightBox->>RightBox: RunSlide(container, Right, in)\nTranslate: -width → 0
+    end
+
+    Note over LeftBox,RightBox: Both animations run simultaneously (200ms)\nItem appears to fly from left list into right list
+
+    LeftBox->>LeftBox: Animation complete\nVisibleItems.Remove(item)\n_inflightCount → 0
+    RightBox->>RightBox: Animation complete\nTranslate snapped to 0\n_inflightCount → 0
+
+    par Both gates release
+        LeftBox->>LeftBox: OnAllAnimationsComplete\n_pipelineBusy = false
+        RightBox->>RightBox: OnAllAnimationsComplete\n_pipelineBusy = false
+    end

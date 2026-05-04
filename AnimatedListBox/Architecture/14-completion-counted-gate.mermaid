@@ -1,0 +1,56 @@
+---
+title: Scenario 13 — Completion-Counted Gate (Not Timer-Based)
+---
+sequenceDiagram
+    participant Box as AnimatedListBox
+    participant Pipeline as Pipeline
+    participant A1 as Animation 1 (slide out)
+    participant A2 as Animation 2 (slide in)
+    participant A3 as Animation 3 (FLIP item B)
+    participant Counter as _inflightCount
+
+    Pipeline->>Box: ProcessSnapshot(Transfer)
+    Box->>Box: OnBeforeAnimatedDiff()
+    Box->>Box: DiffVisible → BeginExit(itemA) + Insert(itemB)
+
+    Box->>A1: RunAnimation(slideOut)\ncts1 created
+    Counter->>Counter: _inflightCount++ → 1
+
+    Box->>A2: RunAnimation(slideIn)\ncts2 created
+    Counter->>Counter: _inflightCount++ → 2
+
+    Note over Box: For OrderChange, FLIP also uses RunAnimation
+    Box->>A3: RunAnimation(FLIP itemB)\ncts3 created
+    Counter->>Counter: _inflightCount++ → 3
+
+    Note over A1,A3: All three animations running in parallel
+
+    A2-->>Counter: Animation 2 completes\nDispatcher.UIThread.Post
+    Counter->>Counter: _inflightCount-- → 2
+    Note over Counter: 2 != 0, don't release gate
+
+    A3-->>Counter: Animation 3 completes
+    Counter->>Counter: _inflightCount-- → 1
+    Note over Counter: 1 != 0, don't release gate
+
+    A1-->>Counter: Animation 1 completes (slowest)
+    Counter->>Counter: _inflightCount-- → 0
+    Note over Counter: 0 == 0 → release gate!
+
+    Counter->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false
+    Pipeline->>Pipeline: TryProcessNext
+
+    Note over Box: --- CANCELLATION PATH ---
+    Note over Box: If SnapAllAnimations is called mid-flight
+
+    Box->>A1: cts1.Cancel()
+    Box->>A2: cts2.Cancel()
+    Box->>A3: cts3.Cancel()
+
+    A1-->>Counter: ContinueWith fires\ncts1.IsCancellationRequested = true\nonCancelled() called\n_inflightCount-- → 2
+    A2-->>Counter: ContinueWith fires\n_inflightCount-- → 1
+    A3-->>Counter: ContinueWith fires\n_inflightCount-- → 0 → release gate
+
+    Note over Counter: Gate is always released\nwhether animations complete\nnaturally or are cancelled.\nNo timer needed, no race.
+
+    Note over Box: Key invariant:\n_inflightCount is incremented before RunAsync\nand decremented in ContinueWith (both paths)\nSo it always reaches 0 eventually

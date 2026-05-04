@@ -1,0 +1,37 @@
+---
+title: Scenario 9 — FullItems Rebound Mid-Animation
+---
+sequenceDiagram
+    participant Host as Host View
+    participant Box as AnimatedListBox
+    participant OldSrc as Old Source Collection
+    participant NewSrc as New Source Collection
+    participant Pipeline as Pipeline
+    participant Anim as In-Flight Animation
+
+    Note over Box: Transfer animation running\n_pipelineBusy = true\n_inflightCount = 2
+
+    Host->>Box: FullItems = newCollection (binding change)
+    Box->>Box: OnFullItemsChanged fires
+
+    Box->>OldSrc: Unsubscribe CollectionChanged
+    Note over OldSrc: No more change events from old source
+
+    Box->>Box: SnapAllAnimations()
+    Note over Anim: All animations cancelled\ncontainers reset\nghosts removed
+
+    Box->>Pipeline: _pipeline.Clear()\n_batchGeneration++\n_pipelineBusy = false
+
+    Box->>NewSrc: Subscribe CollectionChanged
+
+    Box->>Box: ReplaceVisible(BuildPageSlice(newItems))
+    Note over Box: VisibleItems fully replaced\nNo animation — initial population is always instant
+
+    Note over Box: Old source can still fire events\nbut the subscription is gone\n→ they are never received
+
+    Note over Box: New source events will now\nflow through the normal pipeline
+
+    NewSrc-->>Box: CollectionChanged (if new source fires immediately)
+    Box->>Pipeline: Classify and enqueue normally
+
+    Note over Box: Result: Clean handover\nOld animations cancelled\nNew source starts fresh

@@ -1,0 +1,39 @@
+---
+title: Scenario 8 — Page Navigation While Animation In Flight
+---
+sequenceDiagram
+    actor User
+    participant Box as AnimatedListBox
+    participant Pipeline as Pipeline
+    participant Anim as In-Flight Animation
+    participant PageCmd as NextPageCommand
+
+    Note over Box: User is on page 1\nOrder change FLIP animating
+
+    Box->>Anim: FLIP running\n_inflightCount = 3\n_pipelineBusy = true
+
+    Note over Anim: ~100ms into 200ms FLIP
+
+    User->>PageCmd: Click ▶ (NextPageCommand)
+    PageCmd->>Box: CurrentPage++ → CurrentPageProperty.Changed fires
+    Box->>Box: OnCurrentPageChanged()
+
+    Note over Box: Page navigation is ALWAYS instant\nBypasses the pipeline entirely
+
+    Box->>Box: SnapAllAnimations()
+    Note over Anim: All CTSes cancelled\nContainers snapped to (0,0) / opacity 1\nGhosts removed from VisibleItems\n_flipGeneration++ (stale FLIP discarded if pending)\n_inflightCount reset via CTS cancellation paths
+
+    Box->>Pipeline: _pipeline.Clear() — discard all queued work\n_batchGeneration++ — invalidate stale OnBatchComplete\n_pipelineBusy = false
+
+    Box->>Box: UpdatePageCount(full)\nCurrentPage = 2
+
+    Box->>Box: ReplaceVisible(page2items)
+    Note over Box: VisibleItems.Clear() fires\nClearContainerForItemOverride for all containers\nThen new items inserted\nPrepareContainerForItemOverride fires\nNo entry animation (not animated path)
+
+    Note over Box: Page 2 items appear instantly\nNo animation, no artifacts
+
+    Note over Box: If a stale OnBatchComplete fires from\nthe cancelled FLIP timer/counter...
+    Anim-->>Box: OnBatchComplete (stale — from cancelled animation)
+    Box->>Box: Check _batchGeneration\ncapturedGeneration != _batchGeneration\n→ return, do nothing
+
+    Note over Box: Result: Clean instant page change\nno matter what was animating

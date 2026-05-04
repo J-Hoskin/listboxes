@@ -1,0 +1,52 @@
+---
+title: Scenario 6 — Rapid Order Changes (Collapse Behaviour)
+---
+sequenceDiagram
+    participant Service as Backend Service
+    participant Cache as SourceCache
+    participant Sub as Throttled Subscription\n(150ms window)
+    participant Box as AnimatedListBox
+    participant Pipeline as Pipeline
+
+    Note over Service: Service fires rapid order changes\nfaster than animation can keep up
+
+    Service->>Cache: item[2].Order = 1  (t=0ms)
+    Service->>Cache: item[0].Order = 3  (t=20ms)
+    Service->>Cache: item[1].Order = 2  (t=40ms)
+    Service->>Cache: item[3].Order = 0  (t=60ms)
+    Service->>Cache: item[2].Order = 4  (t=80ms)
+
+    Note over Sub: Throttle window (150ms) still open\nAll changes buffered
+
+    Service->>Cache: item[0].Order = 1  (t=100ms)
+
+    Note over Sub: Throttle window expires at t=150ms\nOnly the FINAL state is emitted
+
+    Sub-->>Box: CollectionChanged (Move) — final order only
+
+    Box->>Box: ClassifyChange → OrderChange
+    Box->>Pipeline: Enqueue OrderChange(finalState)
+
+    alt Pipeline is idle
+        Pipeline->>Pipeline: TryProcessNext immediately
+        Pipeline->>Box: ProcessSnapshot(OrderChange)
+        Box->>Box: FLIP animates from current → final order\nSingle smooth animation
+    else Pipeline is busy (transfer playing)
+        Note over Pipeline: Queue: [OrderChange(finalState)]
+        Note over Pipeline: Waits for current animation
+
+        Note over Service: MORE rapid changes arrive\nduring the wait
+
+        Service->>Cache: item[1].Order = 0  (t=200ms)
+        Service->>Cache: item[3].Order = 2  (t=220ms)
+        Sub-->>Box: CollectionChanged after 150ms throttle
+
+        Box->>Pipeline: Check queue for existing OrderChange\nFound! Replace with newer state
+        Note over Pipeline: Queue: [OrderChange(newerFinalState)]\nOlder state discarded
+
+        Note over Box: Transfer finishes
+
+        Pipeline->>Box: ProcessSnapshot(OrderChange — newest state)
+        Box->>Box: FLIP animates to correct final order
+        Note over Box: Result: No matter how many intermediate\norder changes arrived, only one\nFLIP animation plays to the true final state
+    end

@@ -1,0 +1,50 @@
+---
+title: Scenario 12 — FLIP Generation Guard (Stale Capture Discarded)
+---
+sequenceDiagram
+    participant Service as Backend Service
+    participant Cache as SourceCache
+    participant Box as OrderedAnimatedListBox
+    participant Pipeline as Pipeline
+    participant FLIP as FLIP Engine
+
+    Service->>Cache: Order change #1
+    Cache-->>Box: CollectionChanged (Move) after throttle
+
+    Box->>Pipeline: Enqueue OrderChange#1
+    Pipeline->>Box: ProcessSnapshot(OrderChange#1)
+
+    Box->>FLIP: OnBeforeAnimatedDiff()\nCapturePreLayoutBounds()\ncapturedGeneration = ++_flipGeneration  [gen=1]
+
+    Box->>Box: DiffVisible(order#1)\nVisibleItems reordered
+    Note over FLIP: ApplyFlip posted at DispatcherPriority.Render\n(not yet fired — layout pass pending)
+
+    Note over Box: Before Render priority fires...
+
+    Service->>Cache: Order change #2 (rapid)
+    Cache-->>Box: CollectionChanged (Move) after throttle
+
+    Box->>Box: ClassifyChange → OrderChange
+    Box->>Pipeline: Check queue for existing OrderChange\nFound — replace with #2
+
+    Note over Pipeline: Queue: [OrderChange#2]\n(#1 collapsed into #2)
+
+    Box->>Box: _inflightCount reaches 0 from #1 processing
+    Box->>Pipeline: OnAllAnimationsComplete\n_pipelineBusy = false
+    Pipeline->>Pipeline: TryProcessNext\nDequeue OrderChange#2\n_pipelineBusy = true
+
+    Box->>FLIP: OnBeforeAnimatedDiff()\nCapturePreLayoutBounds() — fresh capture\ncapturedGeneration = ++_flipGeneration  [gen=2]
+
+    Box->>Box: DiffVisible(order#2)
+
+    Note over FLIP: Now the Render priority post from gen=1 fires...
+    FLIP->>FLIP: ApplyFlip — check capturedGeneration(1) == _flipGeneration(2)?
+    Note over FLIP: 1 != 2 → STALE CAPTURE\nReturn immediately, do nothing
+
+    Note over FLIP: The gen=2 ApplyFlip fires next...
+    FLIP->>FLIP: ApplyFlip — check capturedGeneration(2) == _flipGeneration(2)?
+    Note over FLIP: 2 == 2 → VALID\nProceed with FLIP animation
+
+    FLIP->>FLIP: Animate items from captured positions\nto new layout positions
+
+    Note over Box: Result: Only one FLIP plays\nto the correct final order.\nStale capture from gen=1 was\ndiscarded without any visual glitch.
