@@ -22,12 +22,12 @@ namespace YourApp.Controls;
 ///
 /// ANIMATION PIPELINE (Option D):
 ///   All source changes are classified, queued, and processed one batch at a time.
-///   The pipeline gate is driven by a completion counter (_inflightCount), not a timer —
-///   the gate releases only when every animation started by a batch has actually finished
-///   or been cancelled. This is correct regardless of load, frame drops, or cancellations.
+///   The pipeline gate is driven by _inflightCount — releases only when every animation
+///   in the current batch has completed or been cancelled. No timers.
 ///
-///   Consecutive order-change updates collapse to the latest state (no stacking).
-///   Transfers jump the queue, snap any in-flight animation, and play immediately.
+///   Transfers    → jump the queue, snap in-flight animations, play immediately.
+///   OrderChanges → collapse to latest state (only the final order animates).
+///   AddRemoves   → collapse to latest state (bulk add/remove animates as one batch).
 ///
 /// TRANSFER ACTIVATION:
 ///   Bind a button in your ItemTemplate:
@@ -96,6 +96,15 @@ public class AnimatedListBox : ListBox
     public static readonly DirectProperty<AnimatedListBox, ICommand> PreviousPageCommandProperty =
         AvaloniaProperty.RegisterDirect<AnimatedListBox, ICommand>(nameof(PreviousPageCommand),
             o => o.PreviousPageCommand);
+
+    /// <summary>
+    /// Bind this OneWay from your VM to programmatically select an item.
+    /// The control jumps to the correct page before setting SelectedItem so the item
+    /// is guaranteed to be in VisibleItems when ListBox resolves the selection.
+    /// For user-click selection flowing back to the VM, bind SelectedItem OneWayToSource.
+    /// </summary>
+    public static readonly StyledProperty<object?> ProgrammaticSelectedItemProperty =
+        AvaloniaProperty.Register<AnimatedListBox, object?>(nameof(ProgrammaticSelectedItem));
 
     // -------------------------------------------------------------------------
     // CLR wrappers
@@ -177,6 +186,12 @@ public class AnimatedListBox : ListBox
     public ICommand NextPageCommand { get; }
     public ICommand PreviousPageCommand { get; }
 
+    public object? ProgrammaticSelectedItem
+    {
+        get => GetValue(ProgrammaticSelectedItemProperty);
+        set => SetValue(ProgrammaticSelectedItemProperty, value);
+    }
+
     // Resolved durations — always use these in animation code, never the raw properties.
     protected TimeSpan ResolvedEntryDuration   => EntryDuration   ?? AnimationDuration;
     protected TimeSpan ResolvedExitDuration    => ExitDuration    ?? AnimationDuration;
@@ -205,29 +220,26 @@ public class AnimatedListBox : ListBox
     private readonly Dictionary<AnimatedItemContainer, CancellationTokenSource> _activeEntries = new();
 
     /// <summary>
-    /// Counts animations currently in flight for the active batch.
-    /// The pipeline gate releases when this reaches zero — not on a timer.
-    /// Incremented before RunAsync, decremented in ContinueWith (both complete and cancelled paths).
+    /// Counts animations currently in flight for the active batch. The pipeline gate releases
+    /// when this reaches zero. Incremented before RunAsync, decremented in ContinueWith on
+    /// both complete and cancelled paths.
     /// </summary>
     private int _inflightCount;
 
     /// <summary>
     /// True while a batch is being processed. No new snapshot is dequeued until false.
-    /// Set to true at ProcessSnapshot, set to false in OnAllAnimationsComplete.
     /// </summary>
     private bool _pipelineBusy;
 
     /// <summary>
-    /// Incremented on every page navigation and source rebind. Lets stale OnAllAnimationsComplete
-    /// callbacks (from cancelled animations that resolve after a page change) detect that they
-    /// are no longer relevant and skip releasing the gate.
+    /// Incremented on page navigation and source rebind. Stale OnAllAnimationsComplete
+    /// callbacks check this and skip releasing the gate if the generation has changed.
     /// </summary>
     private int _batchGeneration;
 
     /// <summary>
-    /// The animation pipeline queue. Processed one snapshot at a time.
-    /// Consecutive OrderChange snapshots collapse — only the latest is kept.
-    /// Transfer snapshots jump the queue and clear it.
+    /// The animation pipeline queue. Transfers jump it and clear it. OrderChanges and
+    /// AddRemoves collapse — only the latest snapshot of each type is kept.
     /// </summary>
     private readonly Queue<SourceSnapshot> _pipeline = new();
 
@@ -253,6 +265,8 @@ public class AnimatedListBox : ListBox
             (o, _) => o.OnPageParametersChanged());
         CurrentPageProperty.Changed.AddClassHandler<AnimatedListBox>(
             (o, _) => o.OnCurrentPageChanged());
+        ProgrammaticSelectedItemProperty.Changed.AddClassHandler<AnimatedListBox>(
+            (o, e) => o.OnProgrammaticSelectedItemChanged(e));
     }
 
     protected override Type StyleKeyOverride => typeof(ListBox);
@@ -277,7 +291,6 @@ public class AnimatedListBox : ListBox
         if (container is not AnimatedItemContainer animated || item is not IAnimatedItem ai)
             return;
 
-        // Cancel any animation running on this container from a previous item.
         if (_activeEntries.TryGetValue(animated, out var oldCts))
         {
             oldCts.Cancel();
@@ -285,20 +298,28 @@ public class AnimatedListBox : ListBox
             _activeEntries.Remove(animated);
         }
 
-        // Snap to neutral — ensures no stale transform/opacity from prior use.
+        // Read pending FLIP delta BEFORE ResetVisuals clears it.
+        var flipDelta = animated.PendingFlipDelta;
         animated.ResetVisuals();
 
-        // Defensively clear any exit tracked for this item. Shouldn't normally happen —
-        // the pipeline gate ensures exits complete before re-entries process — but if it
-        // does, cancelling here prevents the stale completion from removing the re-added item.
+        // Defensively clear any exit for this item. The pipeline gate normally prevents
+        // re-entry before exit completes, but this guards against edge cases.
         if (_activeExits.TryGetValue(ai.Id, out var exit))
         {
             exit.Cancel();
             _activeExits.Remove(ai.Id);
         }
 
-        var reason = Coordinator?.ConsumeEntryReason(ai.Id) ?? EntryReason.Default;
-        StartEntryAnimation(animated, reason);
+        if (flipDelta.HasValue)
+        {
+            // Container was repositioned during DiffVisible — play FLIP instead of entry.
+            OnPendingFlipDelta(animated, flipDelta.Value.X, flipDelta.Value.Y);
+        }
+        else
+        {
+            var reason = Coordinator?.ConsumeEntryReason(ai.Id) ?? EntryReason.Default;
+            StartEntryAnimation(animated, reason);
+        }
     }
 
     protected override void ClearContainerForItemOverride(Control container)
@@ -351,7 +372,7 @@ public class AnimatedListBox : ListBox
         if (type == ChangeType.Transfer)
         {
             // Transfers jump the queue. Snap whatever is running, clear the entire queue
-            // (all queued snapshots are superseded by the current state), and process now.
+            // (current state is the source of truth), and process immediately.
             if (_pipelineBusy)
             {
                 _batchGeneration++;
@@ -363,24 +384,20 @@ public class AnimatedListBox : ListBox
             _pipeline.Clear();
             _pipeline.Enqueue(snapshot);
         }
-        else if (type == ChangeType.OrderChange)
+        else
         {
-            // Collapse: replace the last queued OrderChange with this one, or append.
+            // OrderChange and AddRemove both collapse — replace the last queued snapshot
+            // of the same type with the newer one. Only the latest desired state matters.
             var items = _pipeline.ToList();
-            var lastOrderIdx = items.FindLastIndex(s => s.Type == ChangeType.OrderChange);
+            var lastIdx = items.FindLastIndex(s => s.Type == type);
 
-            if (lastOrderIdx >= 0)
-                items[lastOrderIdx] = snapshot;
+            if (lastIdx >= 0)
+                items[lastIdx] = snapshot;
             else
                 items.Add(snapshot);
 
             _pipeline.Clear();
             foreach (var s in items) _pipeline.Enqueue(s);
-        }
-        else
-        {
-            // AddRemove — always enqueue, never collapse.
-            _pipeline.Enqueue(snapshot);
         }
 
         TryProcessNext();
@@ -402,8 +419,6 @@ public class AnimatedListBox : ListBox
     {
         if (_suppressPageClamp) return;
 
-        // Page navigation is always instant. Snap everything, clear the pipeline,
-        // invalidate any in-flight batch via generation bump, and replace instantly.
         _batchGeneration++;
         _pipeline.Clear();
         _pipelineBusy = false;
@@ -416,6 +431,45 @@ public class AnimatedListBox : ListBox
 
         ((RelayCommand)NextPageCommand).RaiseCanExecuteChanged();
         ((RelayCommand)PreviousPageCommand).RaiseCanExecuteChanged();
+    }
+
+    /// <summary>
+    /// Handles programmatic selection from the VM. Jumps to the correct page first so
+    /// the item is in VisibleItems before ListBox tries to resolve the selection.
+    /// Bind ProgrammaticSelectedItem OneWay from your VM property.
+    /// Bind SelectedItem OneWayToSource to capture user-click selection back to the VM.
+    /// </summary>
+    private void OnProgrammaticSelectedItemChanged(AvaloniaPropertyChangedEventArgs e)
+    {
+        if (e.NewValue is not IAnimatedItem ai)
+        {
+            SelectedItem = null;
+            return;
+        }
+
+        var full = MaterializeFullItems();
+        var index = full.OfType<IAnimatedItem>().ToList().FindIndex(x => x.Id == ai.Id);
+
+        if (index < 0)
+        {
+            // Item does not exist in this list — clear selection silently.
+            SelectedItem = null;
+            return;
+        }
+
+        var pageSize = Math.Max(1, PageSize);
+        var targetPage = index / pageSize;
+
+        if (targetPage != CurrentPage)
+        {
+            // Jump to the page containing the item. OnCurrentPageChanged fires
+            // synchronously and calls ReplaceVisible, putting the item in VisibleItems
+            // before we set SelectedItem below.
+            CurrentPage = targetPage;
+        }
+
+        // Item is now in VisibleItems — ListBox can find and select it.
+        SelectedItem = e.NewValue;
     }
 
     // -------------------------------------------------------------------------
@@ -434,27 +488,18 @@ public class AnimatedListBox : ListBox
 
     private void ProcessSnapshot(SourceSnapshot snapshot)
     {
-        // Capture the generation at the start of this batch. The completion callback
-        // checks this to discard results from batches superseded by page changes or snaps.
-        var capturedGeneration = _batchGeneration;
-
         OnBeforeAnimatedDiff();
         DiffVisible(snapshot.PageItems);
 
-        // If DiffVisible started no animations (e.g. no-op diff), release immediately.
+        // If DiffVisible started no animations (no-op diff), release gate immediately.
         if (_inflightCount == 0)
         {
             _pipelineBusy = false;
             TryProcessNext();
         }
-        // Otherwise the gate releases in OnAllAnimationsComplete when _inflightCount → 0.
+        // Otherwise gate releases in OnAllAnimationsComplete when _inflightCount reaches 0.
     }
 
-    /// <summary>
-    /// Called from RunAnimation's ContinueWith (both complete and cancelled paths) when
-    /// _inflightCount reaches zero. Releases the pipeline gate and processes the next batch.
-    /// Stale callbacks from superseded batches are discarded via the generation check.
-    /// </summary>
     private void OnAllAnimationsComplete(int capturedGeneration)
     {
         if (capturedGeneration != _batchGeneration) return;
@@ -464,12 +509,11 @@ public class AnimatedListBox : ListBox
     }
 
     // -------------------------------------------------------------------------
-    // Snap — cancel all in-flight animations and clear ghost items
+    // Snap
     // -------------------------------------------------------------------------
 
     protected void SnapAllAnimations()
     {
-        // Cancel and reset all entry animations, disposing CTSes.
         foreach (var (container, cts) in _activeEntries)
         {
             cts.Cancel();
@@ -478,8 +522,6 @@ public class AnimatedListBox : ListBox
         }
         _activeEntries.Clear();
 
-        // Cancel all exit animations and remove ghosts by index (not reference)
-        // to guard against DynamicData wrapper recreation changing references.
         foreach (var (id, handle) in _activeExits)
         {
             handle.Cancel();
@@ -488,7 +530,6 @@ public class AnimatedListBox : ListBox
         }
         _activeExits.Clear();
 
-        // Notify subclasses (OrderedAnimatedListBox invalidates pending FLIP state).
         OnSnapAllAnimations();
     }
 
@@ -497,16 +538,27 @@ public class AnimatedListBox : ListBox
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Called by ProcessSnapshot immediately before DiffVisible runs.
-    /// OrderedAnimatedListBox overrides this to capture pre-layout bounds for FLIP.
+    /// Called by ProcessSnapshot immediately before DiffVisible.
+    /// OrderedAnimatedListBox uses this to capture pre-layout bounds for FLIP.
     /// </summary>
     protected virtual void OnBeforeAnimatedDiff() { }
 
     /// <summary>
     /// Called at the end of SnapAllAnimations.
-    /// OrderedAnimatedListBox overrides this to invalidate any pending FLIP capture.
+    /// OrderedAnimatedListBox uses this to invalidate pending FLIP state.
     /// </summary>
     protected virtual void OnSnapAllAnimations() { }
+
+    /// <summary>
+    /// Called by PrepareContainerForItemOverride when a container has a pending FLIP delta.
+    /// Happens when a container is repositioned by DiffVisible before ApplyFlip fires.
+    /// Base implementation snaps to final position. OrderedAnimatedListBox animates from it.
+    /// </summary>
+    protected virtual void OnPendingFlipDelta(AnimatedItemContainer container, double dx, double dy)
+    {
+        container.Translate.X = 0;
+        container.Translate.Y = 0;
+    }
 
     // -------------------------------------------------------------------------
     // Pagination helpers
@@ -570,7 +622,7 @@ public class AnimatedListBox : ListBox
     {
         var desiredIds = desired.OfType<IAnimatedItem>().Select(x => x.Id).ToHashSet();
 
-        // Remove items no longer desired (skip those already mid-exit).
+        // Remove items no longer desired, skipping those already mid-exit.
         for (int i = VisibleItems.Count - 1; i >= 0; i--)
         {
             if (VisibleItems[i] is not IAnimatedItem ai) continue;
@@ -602,8 +654,8 @@ public class AnimatedListBox : ListBox
     }
 
     /// <summary>
-    /// Finds the correct insert position for targetIndex in the desired list, treating
-    /// ghost items (mid-exit) as non-existent so they don't displace new items.
+    /// Finds the correct insert position for targetIndex, treating ghost items (mid-exit)
+    /// as non-existent so they don't displace incoming items.
     /// </summary>
     private int ResolveInsertIndex(int targetIndex)
     {
@@ -611,7 +663,7 @@ public class AnimatedListBox : ListBox
         for (int i = 0; i < VisibleItems.Count; i++)
         {
             if (VisibleItems[i] is IAnimatedItem ai && _activeExits.ContainsKey(ai.Id))
-                continue; // ghost — skip
+                continue;
 
             if (desiredPos == targetIndex)
                 return i;
@@ -636,18 +688,15 @@ public class AnimatedListBox : ListBox
     /// <summary>
     /// Classifies a collection change for pipeline routing.
     ///
-    /// Transfer detection: uses HasAnyPendingReason() rather than inspecting e.NewItems/OldItems.
-    /// DynamicData does not reliably populate those fields, and transfers are structurally
-    /// identical to Add/Remove. The pending reason in the coordinator is the only reliable signal.
-    /// The stamp exists for the duration of a single synchronous cache.Edit call — there is no
-    /// race window where an unrelated change could be misclassified as a transfer.
+    /// Transfer: detected via HasAnyPendingReason(). Stamps exist only for the duration
+    /// of a single synchronous cache.Edit call, so there is no false-positive window.
     ///
     /// OrderChange: DynamicData's .Sort() raises Move for sort-order changes.
-    /// Everything else is AddRemove.
+    /// AddRemove: everything else (Add, Remove, Replace, Reset).
     /// </summary>
     private ChangeType ClassifyChange(NotifyCollectionChangedEventArgs e)
     {
-        if (Coordinator is IPeekableCoordinator p && p.HasAnyPendingReason())
+        if (Coordinator?.HasAnyPendingReason() == true)
             return ChangeType.Transfer;
 
         return e.Action == NotifyCollectionChangedAction.Move
@@ -702,8 +751,7 @@ public class AnimatedListBox : ListBox
         {
             if (exitCts.IsCancellationRequested) return;
 
-            // Only remove if this exit is still the registered one. PrepareContainer clears
-            // the registration if the item was re-added before this callback fired.
+            // Guard: only remove if this exit is still the registered one.
             if (_activeExits.ContainsKey(exitId))
             {
                 _activeExits.Remove(exitId);
@@ -763,14 +811,18 @@ public class AnimatedListBox : ListBox
             ? (offX, offY, 0d, 0d)
             : (0d, 0d, offX, offY);
 
-        // Snap to start immediately — prevents a one-frame flash at the wrong position.
         container.Translate.X = fromX;
         container.Translate.Y = fromY;
+
+        // Exit animations hold their final offscreen position via FillMode.Forward to
+        // prevent a one-frame snap back before the container is removed from VisibleItems.
+        // Entry animations use FillMode.None — the explicit snap in onComplete is sufficient.
+        var fillMode = slidingIn ? FillMode.None : FillMode.Forward;
 
         RunAnimation(
             container,
             container.Translate,
-            BuildTranslateAnimation(fromX, fromY, toX, toY, duration),
+            BuildTranslateAnimation(fromX, fromY, toX, toY, duration, fillMode),
             onComplete: () =>
             {
                 container.Translate.X = toX;
@@ -792,10 +844,13 @@ public class AnimatedListBox : ListBox
     {
         container.Opacity = fromOpacity;
 
+        // Same FillMode logic as RunSlide — exits hold, entries don't need to.
+        var fillMode = toOpacity == 0 ? FillMode.Forward : FillMode.None;
+
         RunAnimation(
             container,
             container,
-            BuildOpacityAnimation(fromOpacity, toOpacity, duration),
+            BuildOpacityAnimation(fromOpacity, toOpacity, duration, fillMode),
             onComplete: () =>
             {
                 container.Opacity = toOpacity;
@@ -806,18 +861,17 @@ public class AnimatedListBox : ListBox
     }
 
     /// <summary>
-    /// Runs animation on target, tracked against container for cancellation.
+    /// Core animation runner. Protected so subclasses (OrderedAnimatedListBox) can route
+    /// FLIP animations through it and participate correctly in the _inflightCount gate.
     ///
-    /// GATE MECHANISM: increments _inflightCount before starting, decrements in ContinueWith
-    /// on both the complete and cancelled paths. When the count reaches zero,
-    /// OnAllAnimationsComplete releases the pipeline gate. This means the gate releases
-    /// exactly when the last animation of the current batch finishes — no timer, no guessing.
+    /// GATE: increments _inflightCount before RunAsync, decrements in ContinueWith on both
+    /// complete and cancelled paths. OnAllAnimationsComplete fires when count hits zero.
     ///
-    /// COMPARE-BEFORE-REMOVE: only removes the _activeEntries entry if it's still the one
-    /// this animation registered. Prevents a stale ContinueWith from a recycled container's
-    /// prior animation clobbering a newer animation's registration.
+    /// COMPARE-BEFORE-REMOVE: only removes the _activeEntries registration if it's still
+    /// the one this animation owns, preventing stale continuations from clobbering newer
+    /// animations on recycled containers.
     /// </summary>
-    private void RunAnimation(
+    protected void RunAnimation(
         AnimatedItemContainer container,
         Animatable target,
         Animation animation,
@@ -835,7 +889,6 @@ public class AnimatedListBox : ListBox
         {
             Dispatcher.UIThread.Post(() =>
             {
-                // Compare-before-remove: only clean up if this is still the active animation.
                 if (_activeEntries.TryGetValue(container, out var registered) && registered == localCts)
                 {
                     _activeEntries.Remove(container);
@@ -847,7 +900,6 @@ public class AnimatedListBox : ListBox
                 else
                     onComplete();
 
-                // Decrement counter and release gate if this was the last animation.
                 _inflightCount--;
                 if (_inflightCount == 0)
                     OnAllAnimationsComplete(capturedGeneration);
@@ -860,12 +912,13 @@ public class AnimatedListBox : ListBox
     // -------------------------------------------------------------------------
 
     private static Animation BuildTranslateAnimation(
-        double fromX, double fromY, double toX, double toY, TimeSpan duration)
+        double fromX, double fromY, double toX, double toY,
+        TimeSpan duration, FillMode fillMode = FillMode.None)
         => new()
         {
             Duration = duration,
             Easing = new CubicEaseOut(),
-            FillMode = FillMode.None,
+            FillMode = fillMode,
             Children =
             {
                 new KeyFrame
@@ -889,12 +942,13 @@ public class AnimatedListBox : ListBox
             }
         };
 
-    private static Animation BuildOpacityAnimation(double from, double to, TimeSpan duration)
+    private static Animation BuildOpacityAnimation(
+        double from, double to, TimeSpan duration, FillMode fillMode = FillMode.None)
         => new()
         {
             Duration = duration,
             Easing = new CubicEaseOut(),
-            FillMode = FillMode.None,
+            FillMode = fillMode,
             Children =
             {
                 new KeyFrame
@@ -911,24 +965,6 @@ public class AnimatedListBox : ListBox
         };
 
     // -------------------------------------------------------------------------
-    // Protected animation accessor for subclasses
-    // -------------------------------------------------------------------------
-
-    /// <summary>
-    /// Runs an animation on a container's TranslateTransform, tracked by the inflight counter.
-    /// Intended for FLIP animations in OrderedAnimatedListBox so they participate in the
-    /// pipeline gate and don't release it prematurely.
-    /// </summary>
-    protected void RunFlipAnimation(
-        AnimatedItemContainer container,
-        Animation animation,
-        Action onComplete,
-        Action onCancelled)
-    {
-        RunAnimation(container, container.Translate, animation, onComplete, onCancelled, default);
-    }
-
-    // -------------------------------------------------------------------------
     // Pagination commands
     // -------------------------------------------------------------------------
 
@@ -941,12 +977,6 @@ public class AnimatedListBox : ListBox
     {
         if (CurrentPage > 0) CurrentPage--;
     }
-
-    // -------------------------------------------------------------------------
-    // Utilities
-    // -------------------------------------------------------------------------
-
-    private static TimeSpan Max(TimeSpan a, TimeSpan b) => a > b ? a : b;
 
     // -------------------------------------------------------------------------
     // Private types
@@ -987,7 +1017,12 @@ public class AnimatedListBox : ListBox
         public bool CanExecute(object? parameter) => _canExecute();
         public void Execute(object? parameter) => _execute();
 
-        public void RaiseCanExecuteChanged() =>
-            Dispatcher.UIThread.Post(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
+        public void RaiseCanExecuteChanged()
+        {
+            if (Dispatcher.UIThread.CheckAccess())
+                CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+            else
+                Dispatcher.UIThread.Post(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
+        }
     }
 }

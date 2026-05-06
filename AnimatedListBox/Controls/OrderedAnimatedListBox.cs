@@ -14,24 +14,37 @@ namespace YourApp.Controls;
 
 /// <summary>
 /// AnimatedListBox variant that orders items by IOrderedAnimatedItem.Order and animates
-/// reorder operations using FLIP (First, Last, Invert, Play).
+/// reorder operations with directional sliding and Z-index layering.
 ///
-/// Reorder cases:
-///   1. Old and new positions both on current page  → FLIP between slots (ResolvedReorderDuration)
-///   2. Item leaves current page due to order change → slide out bottom  (ResolvedExitDuration)
-///   3. Item arrives on current page from elsewhere  → slide in from bottom (ResolvedEntryDuration)
+/// SWAP ANIMATION:
+///   When items change order within the visible page, each item slides straight to its
+///   new position. Items moving up the list render in front (higher Z); items moving
+///   down render behind (lower Z). This creates the visual of items passing each other.
 ///
-/// FLIP animations run through the base class RunAnimation method so they are correctly
-/// counted by _inflightCount and the pipeline gate releases at the right time.
+/// PAGE-EDGE TRANSITIONS:
+///   Items arriving from the next page (higher index) slide up from the bottom edge.
+///   Items arriving from the previous page (lower index) slide down from the top edge.
+///   Items departing are mirrored. New items (not previously in the list) fade in.
+///
+/// RECYCLED CONTAINER HANDLING:
+///   DiffVisible may recycle a container before the Render-priority ApplyFlip fires.
+///   PendingFlipDelta on the container captures the delta so OnPendingFlipDelta can
+///   start the correct animation when PrepareContainerForItemOverride runs.
 /// </summary>
 public class OrderedAnimatedListBox : AnimatedListBox
 {
     private readonly Dictionary<Guid, Rect> _preLayoutBounds = new();
 
     /// <summary>
-    /// Incremented on every OnBeforeAnimatedDiff and every SnapAllAnimations.
-    /// The ApplyFlip closure captures the generation at capture time and skips execution
-    /// if the generation has changed — discarding stale FLIP data from collapsed updates.
+    /// Full ordered list snapshot captured just before DiffVisible runs.
+    /// Used to determine whether a newly appearing item came from the next or previous
+    /// page, so the correct entry direction can be assigned without coordinator stamping.
+    /// </summary>
+    private List<object> _preChangeFullList = new();
+
+    /// <summary>
+    /// Incremented on every OnBeforeAnimatedDiff and every snap.
+    /// ApplyFlip checks this before running to discard stale captures.
     /// </summary>
     private int _flipGeneration;
 
@@ -50,11 +63,15 @@ public class OrderedAnimatedListBox : AnimatedListBox
     }
 
     // -------------------------------------------------------------------------
-    // FLIP hook — capture bounds before layout changes, animate after
+    // FLIP — capture before layout, apply after
     // -------------------------------------------------------------------------
 
     protected override void OnBeforeAnimatedDiff()
     {
+        // Snapshot the full pre-change list so ApplyFlip can compute page-relative
+        // positions for items that weren't previously on the visible page.
+        _preChangeFullList = MaterializeFullItems();
+
         CapturePreLayoutBounds();
         var capturedGeneration = ++_flipGeneration;
 
@@ -88,8 +105,16 @@ public class OrderedAnimatedListBox : AnimatedListBox
         foreach (var item in VisibleItems)
         {
             if (item is not IAnimatedItem ai) continue;
-            if (!_preLayoutBounds.TryGetValue(ai.Id, out var oldRect)) continue;
             if (ContainerFromItem(item) is not AnimatedItemContainer container) continue;
+
+            if (!_preLayoutBounds.TryGetValue(ai.Id, out var oldRect))
+            {
+                // Item was NOT on the visible page before this diff — it's a new arrival.
+                // Determine where it came from and set the appropriate entry reason.
+                var entryReason = ResolvePageEntryReason(ai);
+                SetEntryAnimation(container, entryReason);
+                continue;
+            }
 
             var panel = container.Parent as Visual ?? this;
             var newTopLeft = container.TranslatePoint(new Point(0, 0), panel) ?? new Point(0, 0);
@@ -97,91 +122,255 @@ public class OrderedAnimatedListBox : AnimatedListBox
             var dx = oldRect.X - newTopLeft.X;
             var dy = oldRect.Y - newTopLeft.Y;
 
-            // Skip items that haven't moved (sub-pixel threshold).
             if (Math.Abs(dx) < 0.5 && Math.Abs(dy) < 0.5) continue;
 
-            // Snap to old position, then animate to (0,0) — the natural layout position.
-            container.Translate.X = dx;
-            container.Translate.Y = dy;
-
-            var animation = new Animation
+            if (container.DataContext == item)
             {
-                Duration = ResolvedReorderDuration,
-                Easing = new CubicEaseOut(),
-                FillMode = FillMode.None,
-                Children =
-                {
-                    new KeyFrame
-                    {
-                        Cue = new Cue(0d),
-                        Setters =
-                        {
-                            new Setter(TranslateTransform.XProperty, dx),
-                            new Setter(TranslateTransform.YProperty, dy)
-                        }
-                    },
-                    new KeyFrame
-                    {
-                        Cue = new Cue(1d),
-                        Setters =
-                        {
-                            new Setter(TranslateTransform.XProperty, 0d),
-                            new Setter(TranslateTransform.YProperty, 0d)
-                        }
-                    }
-                }
-            };
-
-            // Route through base RunAnimation so _inflightCount is tracked correctly.
-            // This ensures the pipeline gate doesn't release until FLIP animations finish.
-            var capturedContainer = container;
-            RunAnimationForFlip(
-                container,
-                animation,
-                onComplete: () =>
-                {
-                    capturedContainer.Translate.X = 0;
-                    capturedContainer.Translate.Y = 0;
-                },
-                onCancelled: () =>
-                {
-                    capturedContainer.Translate.X = 0;
-                    capturedContainer.Translate.Y = 0;
-                });
+                StartFlipAnimation(container, dx, dy);
+            }
+            else
+            {
+                // Container was recycled during DiffVisible — stash for PrepareContainer.
+                container.PendingFlipDelta = (dx, dy);
+            }
         }
 
         _preLayoutBounds.Clear();
+        _preChangeFullList = new();
     }
 
     // -------------------------------------------------------------------------
-    // Snap override — invalidate pending FLIP data
+    // Page-edge entry reason detection
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Determines the correct EntryReason for an item newly arriving on the visible page.
+    /// Compares the item's position in the pre-change full list against the current page
+    /// range to decide whether it came from the next page, previous page, or is brand new.
+    /// No coordinator stamping required — the control has all the information it needs.
+    /// </summary>
+    private EntryReason ResolvePageEntryReason(IAnimatedItem ai)
+    {
+        var pageSize = Math.Max(1, PageSize);
+        var pageStart = CurrentPage * pageSize;
+        var pageEnd = pageStart + pageSize - 1;
+
+        // Find where this item was in the full list before the change.
+        var oldIndex = _preChangeFullList
+            .OfType<IAnimatedItem>()
+            .Select((x, i) => (x.Id == ai.Id, i))
+            .Where(t => t.Item1)
+            .Select(t => (int?)t.i)
+            .FirstOrDefault();
+
+        if (oldIndex == null)
+            return EntryReason.Default;         // Truly new item — fade in.
+
+        if (oldIndex > pageEnd)
+            return EntryReason.FromNextPage;    // Was below the page — slide up from bottom.
+
+        return EntryReason.FromPreviousPage;    // Was above the page — slide down from top.
+    }
+
+    // -------------------------------------------------------------------------
+    // Exit reason for items leaving the visible page
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Determines the correct ExitReason for an item leaving the visible page due to
+    /// an order change. Checks where the item ends up in the new full list relative to
+    /// the current page range.
+    /// </summary>
+    private ExitReason ResolvePageExitReason(IAnimatedItem ai)
+    {
+        var full = MaterializeFullItems();
+        var pageSize = Math.Max(1, PageSize);
+        var pageStart = CurrentPage * pageSize;
+        var pageEnd = pageStart + pageSize - 1;
+
+        var newIndex = full
+            .OfType<IAnimatedItem>()
+            .Select((x, i) => (x.Id == ai.Id, i))
+            .Where(t => t.Item1)
+            .Select(t => (int?)t.i)
+            .FirstOrDefault();
+
+        if (newIndex == null)
+            return ExitReason.Default;          // Item removed entirely — fade out.
+
+        if (newIndex > pageEnd)
+            return ExitReason.ToNextPage;       // Moving to a later page — exit bottom.
+
+        return ExitReason.ToPreviousPage;       // Moving to an earlier page — exit top.
+    }
+
+    // -------------------------------------------------------------------------
+    // Entry / exit direction resolution
+    // -------------------------------------------------------------------------
+
+    protected override AnimationDirection? ResolveEntryDirection(EntryReason reason)
+        => reason switch
+        {
+            EntryReason.FromNextPage     => AnimationDirection.Up,   // arrives from below, slides up into view... 
+            EntryReason.FromPreviousPage => AnimationDirection.Down, // arrives from above, slides down into view
+            _                            => base.ResolveEntryDirection(reason)
+        };
+
+    protected override AnimationDirection? ResolveExitDirection(ExitReason reason)
+        => reason switch
+        {
+            ExitReason.ToNextPage     => AnimationDirection.Down, // exits toward bottom
+            ExitReason.ToPreviousPage => AnimationDirection.Up,   // exits toward top
+            _                         => base.ResolveExitDirection(reason)
+        };
+
+    // -------------------------------------------------------------------------
+    // FLIP animation — directional slide with Z-index layering
+    // -------------------------------------------------------------------------
+
+    private void StartFlipAnimation(AnimatedItemContainer container, double dx, double dy)
+    {
+        container.Translate.X = dx;
+        container.Translate.Y = dy;
+
+        // Items moving UP (dy > 0 means old position was lower on screen, new is higher)
+        // render in front. Items moving DOWN render behind.
+        Panel.SetZIndex(container, dy > 0 ? 1 : 0);
+
+        var captured = container;
+        RunAnimation(
+            container,
+            container.Translate,
+            BuildFlipAnimation(dx, dy, ResolvedReorderDuration),
+            onComplete: () =>
+            {
+                captured.Translate.X = 0;
+                captured.Translate.Y = 0;
+                Panel.SetZIndex(captured, 0);
+            },
+            onCancelled: () =>
+            {
+                captured.Translate.X = 0;
+                captured.Translate.Y = 0;
+                Panel.SetZIndex(captured, 0);
+            },
+            cancellation: default);
+    }
+
+    /// <summary>
+    /// Triggers the correct entry animation for a newly-arrived item directly on its
+    /// container. Called from ApplyFlip for items that weren't previously on the page.
+    /// </summary>
+    private void SetEntryAnimation(AnimatedItemContainer container, EntryReason reason)
+    {
+        var direction = ResolveEntryDirection(reason);
+
+        if (direction == null)
+        {
+            // Fade in — run through base entry path which calls RunFade via RunAnimation.
+            // We call this by invoking the same logic PrepareContainer would use.
+            container.Opacity = 0;
+            RunAnimation(
+                container,
+                container,
+                BuildOpacityAnimation(0, 1, ResolvedEntryDuration),
+                onComplete:  () => container.Opacity = 1,
+                onCancelled: () => container.Opacity = 1,
+                cancellation: default);
+        }
+        else
+        {
+            // Slide in from the page edge.
+            var panel = container.Parent as Visual ?? this;
+            var h = container.Bounds.Height > 0 ? container.Bounds.Height
+                  : Bounds.Height > 0 ? Bounds.Height / Math.Max(1, PageSize) : 60;
+
+            var fromY = direction == AnimationDirection.Up ? h : -h;
+
+            container.Translate.X = 0;
+            container.Translate.Y = fromY;
+
+            RunAnimation(
+                container,
+                container.Translate,
+                BuildFlipAnimation(0, fromY, ResolvedEntryDuration),
+                onComplete:  () => { container.Translate.X = 0; container.Translate.Y = 0; },
+                onCancelled: () => { container.Translate.X = 0; container.Translate.Y = 0; },
+                cancellation: default);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // OnPendingFlipDelta — handles containers recycled before ApplyFlip fires
+    // -------------------------------------------------------------------------
+
+    protected override void OnPendingFlipDelta(AnimatedItemContainer container, double dx, double dy)
+    {
+        StartFlipAnimation(container, dx, dy);
+    }
+
+    // -------------------------------------------------------------------------
+    // Snap override — invalidate pending FLIP state
     // -------------------------------------------------------------------------
 
     protected override void OnSnapAllAnimations()
     {
-        // Bump generation so any pending ApplyFlip post is discarded.
         _flipGeneration++;
         _preLayoutBounds.Clear();
+        _preChangeFullList = new();
     }
 
     // -------------------------------------------------------------------------
-    // Page-edge entry/exit directions
+    // Animation builders
     // -------------------------------------------------------------------------
 
-    protected override AnimationDirection? ResolveEntryDirection(EntryReason reason)
-    {
-        if (reason == EntryReason.FromOtherPage)
-            return AnimationDirection.Down;
+    private static Animation BuildFlipAnimation(double fromDx, double fromDy, TimeSpan duration)
+        => new()
+        {
+            Duration = duration,
+            Easing = new CubicEaseOut(),
+            FillMode = FillMode.None,
+            Children =
+            {
+                new KeyFrame
+                {
+                    Cue = new Cue(0d),
+                    Setters =
+                    {
+                        new Setter(TranslateTransform.XProperty, fromDx),
+                        new Setter(TranslateTransform.YProperty, fromDy)
+                    }
+                },
+                new KeyFrame
+                {
+                    Cue = new Cue(1d),
+                    Setters =
+                    {
+                        new Setter(TranslateTransform.XProperty, 0d),
+                        new Setter(TranslateTransform.YProperty, 0d)
+                    }
+                }
+            }
+        };
 
-        return base.ResolveEntryDirection(reason);
-    }
-
-    protected override AnimationDirection? ResolveExitDirection(ExitReason reason)
-    {
-        if (reason == ExitReason.ToOtherPage)
-            return AnimationDirection.Down;
-
-        return base.ResolveExitDirection(reason);
-    }
-
+    private static Animation BuildOpacityAnimation(double from, double to, TimeSpan duration)
+        => new()
+        {
+            Duration = duration,
+            Easing = new CubicEaseOut(),
+            FillMode = FillMode.None,
+            Children =
+            {
+                new KeyFrame
+                {
+                    Cue = new Cue(0d),
+                    Setters = { new Setter(Visual.OpacityProperty, from) }
+                },
+                new KeyFrame
+                {
+                    Cue = new Cue(1d),
+                    Setters = { new Setter(Visual.OpacityProperty, to) }
+                }
+            }
+        };
 }
