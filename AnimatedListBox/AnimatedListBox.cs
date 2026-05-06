@@ -97,6 +97,15 @@ public class AnimatedListBox : ListBox
         AvaloniaProperty.RegisterDirect<AnimatedListBox, ICommand>(nameof(PreviousPageCommand),
             o => o.PreviousPageCommand);
 
+    /// <summary>
+    /// Bind this OneWay from your VM to programmatically select an item.
+    /// The control jumps to the correct page before setting SelectedItem so the item
+    /// is guaranteed to be in VisibleItems when ListBox resolves the selection.
+    /// For user-click selection flowing back to the VM, bind SelectedItem OneWayToSource.
+    /// </summary>
+    public static readonly StyledProperty<object?> ProgrammaticSelectedItemProperty =
+        AvaloniaProperty.Register<AnimatedListBox, object?>(nameof(ProgrammaticSelectedItem));
+
     // -------------------------------------------------------------------------
     // CLR wrappers
     // -------------------------------------------------------------------------
@@ -177,6 +186,12 @@ public class AnimatedListBox : ListBox
     public ICommand NextPageCommand { get; }
     public ICommand PreviousPageCommand { get; }
 
+    public object? ProgrammaticSelectedItem
+    {
+        get => GetValue(ProgrammaticSelectedItemProperty);
+        set => SetValue(ProgrammaticSelectedItemProperty, value);
+    }
+
     // Resolved durations — always use these in animation code, never the raw properties.
     protected TimeSpan ResolvedEntryDuration   => EntryDuration   ?? AnimationDuration;
     protected TimeSpan ResolvedExitDuration    => ExitDuration    ?? AnimationDuration;
@@ -250,6 +265,8 @@ public class AnimatedListBox : ListBox
             (o, _) => o.OnPageParametersChanged());
         CurrentPageProperty.Changed.AddClassHandler<AnimatedListBox>(
             (o, _) => o.OnCurrentPageChanged());
+        ProgrammaticSelectedItemProperty.Changed.AddClassHandler<AnimatedListBox>(
+            (o, e) => o.OnProgrammaticSelectedItemChanged(e));
     }
 
     protected override Type StyleKeyOverride => typeof(ListBox);
@@ -414,6 +431,45 @@ public class AnimatedListBox : ListBox
 
         ((RelayCommand)NextPageCommand).RaiseCanExecuteChanged();
         ((RelayCommand)PreviousPageCommand).RaiseCanExecuteChanged();
+    }
+
+    /// <summary>
+    /// Handles programmatic selection from the VM. Jumps to the correct page first so
+    /// the item is in VisibleItems before ListBox tries to resolve the selection.
+    /// Bind ProgrammaticSelectedItem OneWay from your VM property.
+    /// Bind SelectedItem OneWayToSource to capture user-click selection back to the VM.
+    /// </summary>
+    private void OnProgrammaticSelectedItemChanged(AvaloniaPropertyChangedEventArgs e)
+    {
+        if (e.NewValue is not IAnimatedItem ai)
+        {
+            SelectedItem = null;
+            return;
+        }
+
+        var full = MaterializeFullItems();
+        var index = full.OfType<IAnimatedItem>().ToList().FindIndex(x => x.Id == ai.Id);
+
+        if (index < 0)
+        {
+            // Item does not exist in this list — clear selection silently.
+            SelectedItem = null;
+            return;
+        }
+
+        var pageSize = Math.Max(1, PageSize);
+        var targetPage = index / pageSize;
+
+        if (targetPage != CurrentPage)
+        {
+            // Jump to the page containing the item. OnCurrentPageChanged fires
+            // synchronously and calls ReplaceVisible, putting the item in VisibleItems
+            // before we set SelectedItem below.
+            CurrentPage = targetPage;
+        }
+
+        // Item is now in VisibleItems — ListBox can find and select it.
+        SelectedItem = e.NewValue;
     }
 
     // -------------------------------------------------------------------------
@@ -961,7 +1017,12 @@ public class AnimatedListBox : ListBox
         public bool CanExecute(object? parameter) => _canExecute();
         public void Execute(object? parameter) => _execute();
 
-        public void RaiseCanExecuteChanged() =>
-            Dispatcher.UIThread.Post(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
+        public void RaiseCanExecuteChanged()
+        {
+            if (Dispatcher.UIThread.CheckAccess())
+                CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+            else
+                Dispatcher.UIThread.Post(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
+        }
     }
 }

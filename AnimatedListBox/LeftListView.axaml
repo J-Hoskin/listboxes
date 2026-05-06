@@ -1,0 +1,85 @@
+<!--
+    Example child view for the left list, showing the full selection binding pattern.
+
+    KEY BINDINGS:
+      SelectedItem         OneWayToSource  — user clicks flow OUT to VM
+      ProgrammaticSelectedItem  OneWay    — VM changes flow IN to control (triggers page jump)
+      CurrentPage          TwoWay         — control and VM stay in sync on page
+
+    The two SelectedItem bindings point at the same VM property (SelectedItem).
+    OneWayToSource captures user clicks. OneWay pushes programmatic/service-driven changes.
+    The control handles the page jump in OnProgrammaticSelectedItemChanged before
+    setting ListBox.SelectedItem, so the item is always in VisibleItems when selected.
+-->
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:YourApp.Controls"
+             xmlns:converters="clr-namespace:YourApp.Converters"
+             xmlns:vm="clr-namespace:YourApp.Examples"
+             x:Class="YourApp.Views.LeftListView"
+             x:DataType="vm:LeftListViewModel">
+
+    <UserControl.Resources>
+        <converters:BoolToBrushConverter x:Key="SelectionBg"
+                                         TrueValue="#3a5a8a"
+                                         FalseValue="#1e1e1e" />
+    </UserControl.Resources>
+
+    <StackPanel Spacing="8">
+
+        <controls:OrderedAnimatedListBox x:Name="ListBox"
+            FullItems="{Binding Items}"
+            Coordinator="{Binding Coordinator,
+                          RelativeSource={RelativeSource AncestorType=UserControl}}"
+            TransferCommand="{Binding TransferCommand,
+                              RelativeSource={RelativeSource AncestorType=UserControl}}"
+            SelectedItem="{Binding SelectedItem, Mode=OneWayToSource}"
+            ProgrammaticSelectedItem="{Binding SelectedItem, Mode=OneWay}"
+            CurrentPage="{Binding CurrentPage, Mode=TwoWay}"
+            EntryDirection="Right"
+            ExitDirection="Right"
+            AnimationDuration="0:0:0.2"
+            PageSize="4"
+            Width="240"
+            ClipToBounds="True">
+
+            <controls:OrderedAnimatedListBox.ItemTemplate>
+                <DataTemplate x:DataType="vm:LeftItemVm">
+                    <Border Padding="12,8"
+                            Margin="0,2"
+                            CornerRadius="4"
+                            Background="{Binding IsSelected,
+                                         Converter={StaticResource SelectionBg}}">
+                        <Grid ColumnDefinitions="*,Auto">
+
+                            <TextBlock Grid.Column="0"
+                                       Text="{Binding Name}"
+                                       Foreground="White"
+                                       VerticalAlignment="Center"/>
+
+                            <Button Grid.Column="1"
+                                    Content="→"
+                                    Command="{Binding $parent[controls:OrderedAnimatedListBox].TransferCommand}"
+                                    CommandParameter="{Binding}" />
+
+                        </Grid>
+                    </Border>
+                </DataTemplate>
+            </controls:OrderedAnimatedListBox.ItemTemplate>
+
+        </controls:OrderedAnimatedListBox>
+
+        <!-- Page controls -->
+        <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+            <Button Content="◀" Command="{Binding #ListBox.PreviousPageCommand}" />
+            <TextBlock VerticalAlignment="Center">
+                <Run Text="{Binding #ListBox.CurrentPage}"/>
+                <Run Text=" / "/>
+                <Run Text="{Binding #ListBox.PageCount}"/>
+            </TextBlock>
+            <Button Content="▶" Command="{Binding #ListBox.NextPageCommand}" />
+        </StackPanel>
+
+    </StackPanel>
+
+</UserControl>
