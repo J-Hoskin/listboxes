@@ -357,7 +357,19 @@ public class AnimatedListBox : ListBox
         _pipelineBusy = false;
         _inflightCount = 0;
         SnapAllAnimations();
-        ReplaceVisible(BuildPageSlice(MaterializeFullItems()));
+
+        var full = MaterializeFullItems();
+
+        // Consume and discard any entry reasons stamped for items in the new source.
+        // Stamps belong to the old source context — a transfer that was in-flight when
+        // FullItems was rebound should not cause slide animations on initial population.
+        // ConsumeEntryReason is a no-op for ids with no pending reason so this is safe
+        // to call unconditionally for every item in the new source.
+        if (Coordinator != null)
+            foreach (var item in full.OfType<IAnimatedItem>())
+                Coordinator.ConsumeEntryReason(item.Id);
+
+        ReplaceVisible(BuildPageSlice(full));
     }
 
     private void OnSourceCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -367,7 +379,22 @@ public class AnimatedListBox : ListBox
 
         UpdatePageCount(full);
 
-        var snapshot = new SourceSnapshot(BuildPageSlice(full), type);
+        var pageSlice = BuildPageSlice(full);
+
+        // Consume and discard entry reasons for items NOT on the current page.
+        // A transfer stamp is only meaningful if the item is landing on the visible page
+        // right now. If it lands on a different page, the stamp would otherwise sit in
+        // the coordinator dictionary and incorrectly classify a future page navigation
+        // as a transfer, causing a slide animation instead of a fade.
+        if (Coordinator != null)
+        {
+            var pageIds = pageSlice.OfType<IAnimatedItem>().Select(x => x.Id).ToHashSet();
+            foreach (var item in full.OfType<IAnimatedItem>())
+                if (!pageIds.Contains(item.Id))
+                    Coordinator.ConsumeEntryReason(item.Id);
+        }
+
+        var snapshot = new SourceSnapshot(pageSlice, type);
 
         if (type == ChangeType.Transfer)
         {
