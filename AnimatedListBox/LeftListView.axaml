@@ -1,29 +1,30 @@
 <!--
-    Example child view for the left list, showing the full selection binding pattern.
+    Left list view.
 
-    KEY BINDINGS:
-      SelectedItem         OneWayToSource  — user clicks flow OUT to VM
-      ProgrammaticSelectedItem  OneWay    — VM changes flow IN to control (triggers page jump)
-      CurrentPage          TwoWay         — control and VM stay in sync on page
+    SELECTION:
+      SelectedModel TwoWay — single binding handles both directions.
+      User click  → control pushes raw model out → VM.SelectedModel → SelectionService
+      External set → SelectionService → VM.SelectedModel → binding → control inbound →
+                     control finds wrapper, jumps page, sets ListBox.SelectedItem
 
-    The two SelectedItem bindings point at the same VM property (SelectedItem).
-    OneWayToSource captures user clicks. OneWay pushes programmatic/service-driven changes.
-    The control handles the page jump in OnProgrammaticSelectedItemChanged before
-    setting ListBox.SelectedItem, so the item is always in VisibleItems when selected.
+    SELECTION HIGHLIGHT:
+      Driven by the ListBoxItem :selected pseudo-class. No IsSelected property needed
+      on the wrapper VM. Style the AnimatedItemContainer:selected selector in your theme.
 -->
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:controls="clr-namespace:YourApp.Controls"
-             xmlns:converters="clr-namespace:YourApp.Converters"
              xmlns:vm="clr-namespace:YourApp.Examples"
              x:Class="YourApp.Views.LeftListView"
              x:DataType="vm:LeftListViewModel">
 
-    <UserControl.Resources>
-        <converters:BoolToBrushConverter x:Key="SelectionBg"
-                                         TrueValue="#3a5a8a"
-                                         FalseValue="#1e1e1e" />
-    </UserControl.Resources>
+    <UserControl.Styles>
+        <!-- Selection highlight — targets the Border inside the item template
+             when the containing AnimatedItemContainer is in the selected state. -->
+        <Style Selector="controls|AnimatedItemContainer:selected Border.ItemRoot">
+            <Setter Property="Background" Value="#3a5a8a"/>
+        </Style>
+    </UserControl.Styles>
 
     <StackPanel Spacing="8">
 
@@ -33,8 +34,7 @@
                           RelativeSource={RelativeSource AncestorType=UserControl}}"
             TransferCommand="{Binding TransferCommand,
                               RelativeSource={RelativeSource AncestorType=UserControl}}"
-            SelectedItem="{Binding SelectedItem, Mode=OneWayToSource}"
-            ProgrammaticSelectedItem="{Binding SelectedItem, Mode=OneWay}"
+            SelectedModel="{Binding SelectedModel, Mode=TwoWay}"
             CurrentPage="{Binding CurrentPage, Mode=TwoWay}"
             EntryDirection="Right"
             ExitDirection="Right"
@@ -45,23 +45,24 @@
 
             <controls:OrderedAnimatedListBox.ItemTemplate>
                 <DataTemplate x:DataType="vm:LeftItemVm">
-                    <Border Padding="12,8"
+                    <!--
+                        Give the Border the "ItemRoot" class so the :selected style above
+                        can target it specifically without affecting other Borders in the template.
+                    -->
+                    <Border Classes="ItemRoot"
+                            Padding="12,8"
                             Margin="0,2"
                             CornerRadius="4"
-                            Background="{Binding IsSelected,
-                                         Converter={StaticResource SelectionBg}}">
+                            Background="#1e1e1e">
                         <Grid ColumnDefinitions="*,Auto">
-
                             <TextBlock Grid.Column="0"
                                        Text="{Binding Name}"
                                        Foreground="White"
                                        VerticalAlignment="Center"/>
-
                             <Button Grid.Column="1"
                                     Content="→"
                                     Command="{Binding $parent[controls:OrderedAnimatedListBox].TransferCommand}"
                                     CommandParameter="{Binding}" />
-
                         </Grid>
                     </Border>
                 </DataTemplate>
